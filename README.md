@@ -62,7 +62,7 @@ WiFiBar.cs            全部源码（界面绘制 + 业务逻辑，单文件）
 pics/WiFiBar.ico      程序图标，编译时以 /win32icon 嵌入 exe
 pics/screenshot.png   README 用截图
 WiFiBar.exe           编译产物
-bak/                  历史备份
+
 ```
 
 ## 实现说明
