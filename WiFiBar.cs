@@ -6,6 +6,8 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -247,7 +249,9 @@ namespace WiFiBar
         {
             string safe = ssid.Replace("\"", string.Empty);
             string output;
-            try { output = Run("wlan connect name=\"" + safe + "\" ssid=\"" + safe + "\""); }
+            // 只按配置文件名称连接：中文 SSID 经 ssid= 参数传入时会被按 ANSI 编码比较，
+            // netsh 会报“配置文件中不存在 SSID”，导致中文网络无法切换。
+            try { output = Run("wlan connect name=\"" + safe + "\""); }
             catch { return false; }
 
             return output.IndexOf("success", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -361,6 +365,11 @@ namespace WiFiBar
         // 刘海屏展开面板
         private const int RowHeight = 30;
         private const int FooterHeight = 66;
+        // 页脚上方的两行信息：本机 IP / 网关
+        private const int MetaRowHeight = 30;
+        private const int MetaBlockHeight = 62;
+        // 折叠态只显示信号最强的前 N 个网络
+        private const int MaxCollapsedNetworks = 10;
         private const int NotchCollapsedRadius = 15;
         private const int NotchBottomRadius = 16;
         private const int NotchPaddingX = 20;
@@ -375,9 +384,9 @@ namespace WiFiBar
         private static readonly Color NotchHoverBackground = Color.FromArgb(38, 38, 42);
         private static readonly Color MacAccent = Color.FromArgb(10, 132, 255);
         // 刘海投影：单独的分层窗口绘制，随面板尺寸动画同步
-        private const int ShadowSpread = 26;
-        private const int ShadowOffsetY = 8;
-        private const int ShadowAlpha = 120;
+        private const int ShadowSpread = 32;
+        private const int ShadowOffsetY = 10;
+        private const int ShadowAlpha = 92;
         private ShadowWindow shadowWindow;
         private bool expanded;
         private float expandT;
@@ -387,7 +396,15 @@ namespace WiFiBar
         private System.Windows.Forms.Timer animTimer;
         private int hoverRow = -1;
         private int hoverFooter = -1;
+        private int hoverMeta = -1;
+        private bool hoverMore;
+        private bool showAllNetworks;
         private int scrollOffset;
+        private string localIp;
+        private string gatewayIp;
+        private bool copyFeedback;
+        private readonly System.Windows.Forms.Timer copyTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer ipTimer = new System.Windows.Forms.Timer();
         private Rectangle footerNormalRect;
         private Rectangle footerExitRect;
         // 普通模式：面板锚点（条子原始位置）与展开方向
@@ -456,6 +473,19 @@ namespace WiFiBar
             scanTimer.Tick += (s, e) => BeginScan(true);
             scanTimer.Start();
 
+            // 面板展开期间定期刷新本机地址，应对 DHCP 变化
+            ipTimer.Interval = 5000;
+            ipTimer.Tick += (s, e) => RefreshLocalAddress();
+
+            // 「已复制」行内提示，1.2 秒后自动消失
+            copyTimer.Interval = 1200;
+            copyTimer.Tick += (s, e) =>
+            {
+                copyTimer.Stop();
+                copyFeedback = false;
+                Invalidate();
+            };
+
             Shown += (s, e) =>
             {
                 FitToText();
@@ -483,7 +513,7 @@ namespace WiFiBar
             {
                 if (expanded && e.Button == MouseButtons.None)
                 {
-                    UpdateHoverRow(e.Y);
+                    UpdateHoverRow(e.Location);
                     UpdateFooterHover(e.Location);
                 }
                 return;
@@ -992,6 +1022,8 @@ namespace WiFiBar
         {
             if (expanded) return;
 
+            RefreshLocalAddress();
+
             if (!notchMode)
             {
                 // 记录条子原位，并按屏幕剩余空间决定向上还是向下展开
@@ -1009,7 +1041,12 @@ namespace WiFiBar
             expanded = true;
             hoverRow = -1;
             hoverFooter = -1;
+            hoverMeta = -1;
+            hoverMore = false;
+            showAllNetworks = false;
             scrollOffset = 0;
+            copyFeedback = false;
+            copyTimer.Stop();
             toolTip.Hide(this);
             UpdateToolTip();
             RefreshNotchList();
@@ -1019,6 +1056,7 @@ namespace WiFiBar
             Activate();
             RefreshStatus();
             BeginScan(true);
+            ipTimer.Start();
         }
 
         private void CollapsePanel()
@@ -1027,6 +1065,13 @@ namespace WiFiBar
             expanded = false;
             hoverRow = -1;
             hoverFooter = -1;
+            hoverMeta = -1;
+            hoverMore = false;
+            showAllNetworks = false;
+            scrollOffset = 0;
+            copyFeedback = false;
+            copyTimer.Stop();
+            ipTimer.Stop();
             UpdateToolTip();
             StartPanelAnimation();
             UpdateOpacity();
@@ -1116,7 +1161,7 @@ namespace WiFiBar
             UpdateShadow();
 
             // 高度变化后滚动位置可能越界
-            int maxScroll = Math.Max(0, notchNetworks.Count - VisibleRowCount);
+            int maxScroll = Math.Max(0, TotalListRows - VisibleRowCount);
             if (scrollOffset > maxScroll) scrollOffset = maxScroll;
 
             Invalidate();
@@ -1183,8 +1228,8 @@ namespace WiFiBar
             }
 
             // 两次方框模糊得到柔和的投影边缘
-            BoxBlur(alpha, width, height, 9);
-            BoxBlur(alpha, width, height, 9);
+            BoxBlur(alpha, width, height, 11);
+            BoxBlur(alpha, width, height, 11);
 
             var result = new Bitmap(width, height, PixelFormat.Format32bppPArgb);
             BitmapData target = result.LockBits(new Rectangle(0, 0, width, height),
@@ -1270,16 +1315,52 @@ namespace WiFiBar
                 widestSignal = Math.Max(widestSignal,
                     TextRenderer.MeasureText(network.Signal + "%", textFont).Width);
             }
+            if (HasMoreNetworks)
+            {
+                widestSsid = Math.Max(widestSsid, TextRenderer.MeasureText(
+                    "更多 (" + (notchNetworks.Count - MaxCollapsedNetworks) + ")", textFont).Width);
+            }
 
             // 布局：勾选槽 + SSID 左对齐 + 信号右对齐；DrawString 比测量略宽，留 12px 余量
             openWidth = Math.Max(collapsedWidth,
                 NotchPaddingX * 2 + NotchCheckSlot + widestSsid + 16 + widestSignal + 12);
 
-            int rows = Math.Max(1, notchNetworks.Count);
+            // 信息行：左侧标签 + 右侧等宽数值，取两行中较宽的一行；
+            // 预留「已复制」提示的宽度，避免提示与数值重叠
+            int toastWidth = TextRenderer.MeasureText("已复制", textFont).Width;
+            int metaWidth = Math.Max(
+                TextRenderer.MeasureText("IP地址", textFont).Width + 16 + toastWidth +
+                    TextRenderer.MeasureText(localIp ?? "—", textFont).Width,
+                TextRenderer.MeasureText("IP网关", textFont).Width + 24 +
+                    TextRenderer.MeasureText(gatewayIp ?? "—", textFont).Width);
+            openWidth = Math.Max(openWidth, NotchPaddingX * 2 + metaWidth);
+
+            int rows = Math.Max(1, TotalListRows);
             int naturalHeight = BarHeight + NotchListTopPadding + rows * RowHeight +
-                                NotchListBottomPadding + FooterHeight;
+                                NotchListBottomPadding + MetaBlockHeight + FooterHeight;
             openHeight = Math.Min(Screen.PrimaryScreen.WorkingArea.Height - 60,
                                   Math.Max(BarHeight + 70, naturalHeight));
+        }
+
+        // 当前实际显示的网络数：折叠态只取前 N 个
+        private int DisplayedNetworkCount
+        {
+            get
+            {
+                if (notchNetworks.Count <= MaxCollapsedNetworks) return notchNetworks.Count;
+                return showAllNetworks ? notchNetworks.Count : MaxCollapsedNetworks;
+            }
+        }
+
+        private bool HasMoreNetworks
+        {
+            get { return notchNetworks.Count > MaxCollapsedNetworks; }
+        }
+
+        // 列表总行数（含「更多 / 收起」行）
+        private int TotalListRows
+        {
+            get { return DisplayedNetworkCount + (HasMoreNetworks ? 1 : 0); }
         }
 
         private int VisibleRowCount
@@ -1287,13 +1368,77 @@ namespace WiFiBar
             get
             {
                 return Math.Max(1, (Height - BarHeight - NotchListTopPadding -
-                                    NotchListBottomPadding - FooterHeight) / RowHeight);
+                                    NotchListBottomPadding - MetaBlockHeight - FooterHeight) / RowHeight);
             }
         }
 
         private int MaxScroll
         {
-            get { return Math.Max(0, notchNetworks.Count - VisibleRowCount); }
+            get { return Math.Max(0, TotalListRows - VisibleRowCount); }
+        }
+
+        // 信息行矩形：0 = 本机 IP，1 = 网关
+        private Rectangle MetaRowRect(int index)
+        {
+            int top = BodyRect().Bottom - FooterHeight - MetaBlockHeight + 2 + index * MetaRowHeight;
+            return new Rectangle(8, top, Width - 16, MetaRowHeight);
+        }
+
+        // 取当前上网网卡的第一个 IPv4 及其网关，避免解析 ipconfig 文本
+        private void RefreshLocalAddress()
+        {
+            string ip = null;
+            string gateway = null;
+
+            try
+            {
+                foreach (NetworkInterface card in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (card.OperationalStatus != OperationalStatus.Up) continue;
+                    if (card.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+                        card.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
+
+                    IPInterfaceProperties properties = card.GetIPProperties();
+                    string candidate = null;
+                    foreach (UnicastIPAddressInformation address in properties.UnicastAddresses)
+                    {
+                        if (address.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        candidate = address.Address.ToString();
+                        break;
+                    }
+
+                    if (candidate == null) continue;
+
+                    ip = candidate;
+                    foreach (GatewayIPAddressInformation item in properties.GatewayAddresses)
+                    {
+                        if (item.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        gateway = item.Address.ToString();
+                        break;
+                    }
+                    break;
+                }
+            }
+            catch { }
+
+            if (ip == localIp && gateway == gatewayIp) return;
+
+            localIp = ip;
+            gatewayIp = gateway;
+            if (expanded) Invalidate();
+        }
+
+        private void CopyLocalAddress()
+        {
+            if (string.IsNullOrEmpty(localIp)) return;
+
+            try { Clipboard.SetText(localIp); }
+            catch { return; }
+
+            copyFeedback = true;
+            copyTimer.Stop();
+            copyTimer.Start();
+            Invalidate();
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -1308,11 +1453,12 @@ namespace WiFiBar
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            if (expanded && notchNetworks.Count > VisibleRowCount)
+            if (expanded && TotalListRows > VisibleRowCount)
             {
                 int delta = e.Delta > 0 ? -1 : 1;
                 scrollOffset = Math.Max(0, Math.Min(MaxScroll, scrollOffset + delta));
                 hoverRow = -1;
+                hoverMore = false;
                 Invalidate();
                 return;
             }
@@ -1334,23 +1480,38 @@ namespace WiFiBar
             return new Rectangle(0, 0, Width, Math.Max(0, header.Top));
         }
 
-        private void UpdateHoverRow(int y)
+        private void UpdateHoverRow(Point location)
         {
             int row = -1;
+            bool more = false;
+            int meta = -1;
             int listTop = BodyRect().Top + NotchListTopPadding;
-            if (y >= listTop)
+            int listBottom = listTop + VisibleRowCount * RowHeight;
+
+            if (location.Y >= listTop && location.Y < listBottom)
             {
-                int visibleIndex = (y - listTop) / RowHeight;
-                if (visibleIndex < VisibleRowCount)
+                int visibleIndex = (location.Y - listTop) / RowHeight;
+                int index = scrollOffset + visibleIndex;
+                if (index < DisplayedNetworkCount) row = index;
+                else if (index == DisplayedNetworkCount && HasMoreNetworks) more = true;
+            }
+            else
+            {
+                for (int i = 0; i < 2; i++)
                 {
-                    int index = scrollOffset + visibleIndex;
-                    if (index < notchNetworks.Count) row = index;
+                    if (MetaRowRect(i).Contains(location))
+                    {
+                        meta = i;
+                        break;
+                    }
                 }
             }
 
-            if (row != hoverRow)
+            if (row != hoverRow || more != hoverMore || meta != hoverMeta)
             {
                 hoverRow = row;
+                hoverMore = more;
+                hoverMeta = meta;
                 Invalidate();
             }
         }
@@ -1391,21 +1552,43 @@ namespace WiFiBar
                 return;
             }
 
+            // 信息行：IP 行点击复制，网关行不响应
+            if (MetaRowRect(0).Contains(location))
+            {
+                CopyLocalAddress();
+                return;
+            }
+            if (MetaRowRect(1).Contains(location)) return;
+
             int listTop = BodyRect().Top + NotchListTopPadding;
-            if (location.Y >= listTop)
+            if (location.Y >= listTop && location.Y < listTop + VisibleRowCount * RowHeight)
             {
                 int visibleIndex = (location.Y - listTop) / RowHeight;
                 if (visibleIndex < VisibleRowCount)
                 {
                     int index = scrollOffset + visibleIndex;
-                    if (index >= 0 && index < notchNetworks.Count)
+                    if (index >= 0 && index < DisplayedNetworkCount)
                     {
                         string ssid = notchNetworks[index].Ssid;
                         CollapsePanel();
                         ConnectTo(ssid);
                     }
+                    else if (index == DisplayedNetworkCount && HasMoreNetworks)
+                    {
+                        ToggleShowAllNetworks();
+                    }
                 }
             }
+        }
+
+        // 展开 / 收起其余网络；关闭面板时由 CollapsePanel 复位
+        private void ToggleShowAllNetworks()
+        {
+            showAllNetworks = !showAllNetworks;
+            hoverRow = -1;
+            hoverMore = false;
+            scrollOffset = 0;
+            ApplyPanelLayout();
         }
 
         private void DrawPanelBody(Graphics g, Rectangle body)
@@ -1443,12 +1626,25 @@ namespace WiFiBar
             {
                 right.Alignment = StringAlignment.Far;
 
+                int displayed = DisplayedNetworkCount;
+                bool moreRow = HasMoreNetworks;
+                int totalRows = displayed + (moreRow ? 1 : 0);
+
                 for (int i = 0; i < visible; i++)
                 {
                     int index = start + i;
-                    if (index >= notchNetworks.Count) break;
+                    if (index >= totalRows) break;
 
                     int y = listTop + i * RowHeight;
+                    int contentLeft = NotchPaddingX + NotchCheckSlot;
+
+                    // 列表末尾的「更多 (N) / 收起」行
+                    if (index >= displayed)
+                    {
+                        DrawMoreRow(g, y, contentLeft, a, left);
+                        continue;
+                    }
+
                     WlanApi.Network network = notchNetworks[index];
                     bool isCurrent = currentSsid != null &&
                         string.Equals(network.Ssid, currentSsid, StringComparison.OrdinalIgnoreCase);
@@ -1484,7 +1680,6 @@ namespace WiFiBar
                         }
                     }
 
-                    int contentLeft = NotchPaddingX + NotchCheckSlot;
                     using (var brush = new SolidBrush(Color.FromArgb(isCurrent ? a : a * 205 / 255, 255, 255, 255)))
                     {
                         g.DrawString(network.Ssid, isCurrent ? boldFont : textFont, brush,
@@ -1498,13 +1693,9 @@ namespace WiFiBar
                 }
             }
 
-            int footerTop = body.Bottom - FooterHeight;
+            DrawMetaBlock(g, a);
 
-            // 列表与底部控制之间的细分隔线
-            using (var pen = new Pen(Color.FromArgb(a * 24 / 255, 255, 255, 255), 1f))
-            {
-                g.DrawLine(pen, 14, footerTop - 1, Width - 14, footerTop - 1);
-            }
+            int footerTop = body.Bottom - FooterHeight;
 
             // 底部：两行菜单项，图标 + 文字，整行响应悬停
             footerNormalRect = new Rectangle(8, footerTop + 4, Width - 16, RowHeight - 2);
@@ -1525,6 +1716,110 @@ namespace WiFiBar
 
             DrawFooterItem(g, footerNormalRect, notchMode ? "普通模式" : "刘海屏模式", 0, true, a);
             DrawFooterItem(g, footerExitRect, "退出", 1, false, a);
+        }
+
+        // 列表末尾的「更多 (N) / 收起」折叠行
+        private void DrawMoreRow(Graphics g, int y, int contentLeft, int a, StringFormat left)
+        {
+            if (hoverMore)
+            {
+                using (GraphicsPath path = RoundedRect(
+                    new RectangleF(8, y + 2, Width - 16, RowHeight - 4), 8f))
+                using (var brush = new SolidBrush(Color.FromArgb(a * 22 / 255, 255, 255, 255)))
+                {
+                    g.FillPath(brush, path);
+                }
+            }
+
+            float cx = NotchPaddingX + NotchCheckSlot / 2f - 1f;
+            float cy = y + RowHeight / 2f;
+            using (var pen = new Pen(Color.FromArgb(a * 160 / 255, 255, 255, 255), 1.5f)
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round,
+                LineJoin = LineJoin.Round
+            })
+            {
+                if (showAllNetworks)
+                {
+                    g.DrawLines(pen, new[]
+                    {
+                        new PointF(cx - 2.6f, cy + 1.2f),
+                        new PointF(cx, cy - 1.4f),
+                        new PointF(cx + 2.6f, cy + 1.2f)
+                    });
+                }
+                else
+                {
+                    g.DrawLines(pen, new[]
+                    {
+                        new PointF(cx - 2.6f, cy - 1.2f),
+                        new PointF(cx, cy + 1.4f),
+                        new PointF(cx + 2.6f, cy - 1.2f)
+                    });
+                }
+            }
+
+            string label = showAllNetworks
+                ? "收起"
+                : "更多 (" + (notchNetworks.Count - MaxCollapsedNetworks) + ")";
+            using (var brush = new SolidBrush(Color.FromArgb(a * 160 / 255, 255, 255, 255)))
+            {
+                g.DrawString(label, textFont, brush,
+                    new RectangleF(contentLeft, y, Width - contentLeft - NotchPaddingX, RowHeight), left);
+            }
+        }
+
+        // 页脚上方的两行信息：本机 IP（可点击复制）与网关
+        private void DrawMetaBlock(Graphics g, int a)
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                if (hoverMeta != i) continue;
+
+                Rectangle rect = MetaRowRect(i);
+                using (GraphicsPath hl = RoundedRect(
+                    new RectangleF(rect.X, rect.Y, rect.Width, rect.Height), 8f))
+                using (var brush = new SolidBrush(Color.FromArgb(a * 22 / 255, 255, 255, 255)))
+                {
+                    g.FillPath(brush, hl);
+                }
+            }
+
+            Rectangle ipRect = MetaRowRect(0);
+            Rectangle gatewayRect = MetaRowRect(1);
+            int labelWidth = TextRenderer.MeasureText("IP地址", textFont).Width;
+
+            // 与网络列表同一套字色：左侧标签为次要色，右侧数值为主色
+            using (var labelBrush = new SolidBrush(Color.FromArgb(a * 115 / 255, 255, 255, 255)))
+            using (var valueBrush = new SolidBrush(Color.FromArgb(a * 205 / 255, 255, 255, 255)))
+            using (var copiedBrush = new SolidBrush(Color.FromArgb(a, MacAccent)))
+            using (var left = new StringFormat
+            {
+                LineAlignment = StringAlignment.Center,
+                Trimming = StringTrimming.EllipsisCharacter,
+                FormatFlags = StringFormatFlags.NoWrap
+            })
+            using (var right = (StringFormat)left.Clone())
+            {
+                right.Alignment = StringAlignment.Far;
+
+                g.DrawString("IP地址", textFont, labelBrush,
+                    new RectangleF(NotchPaddingX, ipRect.Y, Width - NotchPaddingX * 2, ipRect.Height), left);
+                if (copyFeedback)
+                {
+                    g.DrawString("已复制", textFont, copiedBrush,
+                        new RectangleF(NotchPaddingX + labelWidth + 8, ipRect.Y,
+                            Width - NotchPaddingX * 2, ipRect.Height), left);
+                }
+                g.DrawString(localIp ?? "—", textFont, valueBrush,
+                    new RectangleF(0, ipRect.Y, Width - NotchPaddingX, ipRect.Height), right);
+
+                g.DrawString("IP网关", textFont, labelBrush,
+                    new RectangleF(NotchPaddingX, gatewayRect.Y, Width - NotchPaddingX * 2, gatewayRect.Height), left);
+                g.DrawString(gatewayIp ?? "—", textFont, valueBrush,
+                    new RectangleF(0, gatewayRect.Y, Width - NotchPaddingX, gatewayRect.Height), right);
+            }
         }
 
         // 底部菜单行：图标 + 文字，悬停时整体提亮
@@ -1649,6 +1944,14 @@ namespace WiFiBar
                 using (var border = new Pen(Color.FromArgb(84, 84, 84), 1f))
                 {
                     g.DrawPath(border, borderPath);
+                }
+
+                // 内侧一圈极轻的高光，模拟系统材质的受光面
+                using (GraphicsPath rimPath = PanelPath(
+                    new RectangleF(1.5f, 1.5f, Width - 3f, Height - 3f), topRadius, bottomRadius))
+                using (var rim = new Pen(Color.FromArgb(18, 255, 255, 255), 1f))
+                {
+                    g.DrawPath(rim, rimPath);
                 }
                 g.PixelOffsetMode = oldOffsetMode;
             }
